@@ -2,7 +2,7 @@
 // @name         自动答题助手
 // @namespace    https://github.com/auto-answer-assistant
 // @version      1.1.0
-// @description  智能识别网页题目，调用AI API自动作答，支持超星学习通、广州开放大学等平台
+// @description  智能识别网页题目，调用AI API自动作答，支持超星学习通
 // @author       Auto Answer Assistant
 // @match        *://*/*
 // @match        file:///*
