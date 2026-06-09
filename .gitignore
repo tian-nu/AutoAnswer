@@ -1,3 +1,5 @@
 .codebuddy/
 node_modules/
 *.log
+_sandbox/
+tasks/archive/

@@ -1,11 +1,10 @@
 // ==UserScript==
 // @name         自动答题助手
 // @namespace    https://github.com/auto-answer-assistant
-// @version      1.1.0
-// @description  智能识别网页题目，调用AI API自动作答，支持超星学习通
+// @version      1.3.0
+// @description  智能识别网页题目，调用AI API自动作答，支持超星学习通平台
 // @author       Auto Answer Assistant
-// @match        *://*/*
-// @match        file:///*
+// @match        *://*.chaoxing.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
@@ -68,6 +67,7 @@
     baseUrl: 'https://api.openai.com',
     chatPath: '/v1/chat/completions',
     isReasoning: false,
+    reasoningEffort: 'high',
     parallelCount: 3,
     apiProvider: 'openai'
   };
@@ -109,12 +109,6 @@
   };
 
   // ==================== API 调用模块 ====================
-  function isReasoningModel(model) {
-    if (!model) return false;
-    const reasoningModels = ['o1', 'o1-mini', 'o1-preview', 'deepseek-reasoner', 'r1'];
-    return reasoningModels.some(rm => model.toLowerCase().includes(rm));
-  }
-
   function buildQuestionContent(questionPayload) {
     if (typeof questionPayload === 'string') return questionPayload;
     const currentText = questionPayload?.text || '';
@@ -159,7 +153,8 @@
     return new Promise((resolve, reject) => {
       if (!settings.apiKey) { reject(new Error('API密钥未设置')); return; }
       const url = `${settings.baseUrl}${settings.chatPath}`;
-      const isReasoning = settings.isReasoning || isReasoningModel(settings.model);
+      const isReasoning = settings.isReasoning || false;
+      const isDeepSeek = settings.apiProvider === 'deepseek';
       const messages = [];
       if (isReasoning) {
         const promptContent = buildQuestionContent(questionPayload);
@@ -172,6 +167,10 @@
       }
       const body = { model: settings.model, messages };
       if (isReasoning) {
+        if (isDeepSeek) {
+          body.thinking = { type: 'enabled' };
+          body.reasoning_effort = settings.reasoningEffort || 'high';
+        }
         body.max_completion_tokens = settings.maxTokens || 2000;
       } else {
         body.temperature = settings.temperature || 0.3;
@@ -182,7 +181,7 @@
         if (settings.stop) body.stop = settings.stop.split(',').map(s => s.trim()).filter(Boolean);
       }
       body.stream = settings.stream || false;
-      console.log('[AutoAnswer] API请求:', { url, model: settings.model, isReasoning });
+      console.log('[AutoAnswer] API请求:', { url, model: settings.model, isReasoning, isDeepSeek });
       GM_xmlhttpRequest({
         method: 'POST', url, headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiKey}` },
         data: JSON.stringify(body), timeout: 60000,
@@ -198,12 +197,35 @@
             const choice = data.choices[0]; const message = choice.message || choice.text;
             if (!message) { reject(new Error('API响应格式错误: 缺少message字段')); return; }
             let answerContent = message.content || message;
-            if (isReasoning && typeof answerContent === 'string') answerContent = extractFinalAnswer(answerContent);
+            if (isReasoning && typeof answerContent === 'string') {
+              answerContent = extractFinalAnswer(answerContent);
+            }
             resolve({ success: true, answer: answerContent, usage: data.usage || {}, model: data.model || settings.model });
           } catch (e) { reject(new Error(`解析响应失败: ${e.message}`)); }
         },
         onerror() { reject(new Error('网络请求失败')); },
         ontimeout() { reject(new Error('请求超时（60秒）')); }
+      });
+    });
+  }
+
+  function fetchModels(settings) {
+    return new Promise((resolve, reject) => {
+      if (!settings.apiKey) { reject(new Error('API密钥未设置')); return; }
+      const url = `${settings.baseUrl}/v1/models`;
+      GM_xmlhttpRequest({
+        method: 'GET', url, headers: { 'Authorization': `Bearer ${settings.apiKey}` }, timeout: 15000,
+        onload(response) {
+          try {
+            if (response.status < 200 || response.status >= 300) { reject(new Error(`HTTP ${response.status}`)); return; }
+            const data = JSON.parse(response.responseText);
+            const models = (data.data || []).map(m => m.id).filter(Boolean).sort();
+            if (models.length === 0) { reject(new Error('未获取到模型')); return; }
+            resolve(models);
+          } catch (e) { reject(new Error(`解析失败: ${e.message}`)); }
+        },
+        onerror() { reject(new Error('网络请求失败')); },
+        ontimeout() { reject(new Error('请求超时')); }
       });
     });
   }
@@ -216,7 +238,7 @@
     } else {
       const allSelectors = [
         '.TiMu .questionLi', '.TiMu .singleQuesId', '.questionLi.singleQuesId', '.TiMu [data]',
-        'li.subject', '.exam-subjects li.subject', '.subjects-jit-display > li', 'ng-form.subject', 'form.subject', '.subject[ng-class]',
+        '.readComprehensionQues .reading_answer',
         '.question', '.question-item', '.question-box', '.exam-question', '[data-question]', '.problem', '.problem-item', '.quiz-item', '.test-item'
       ];
       for (const selector of allSelectors) { try { const elements = document.querySelectorAll(selector); for (const el of elements) { const q = extractQuestion(el); if (q) detectedQuestions.push(q); } } catch (e) { /* ignore */ } }
@@ -227,34 +249,77 @@
   function extractQuestion(element) {
     if (!element) return null;
     let questionId = element.getAttribute('data') || element.getAttribute('id') || element.getAttribute('data-question-id') || `q-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
-    let questionType = element.getAttribute('typename') || element.getAttribute('data-type') || element.getAttribute('ng-class') || 'unknown';
+    let questionType = element.getAttribute('typename') || element.getAttribute('data-type') || 'unknown';
     const classList = element.className || '';
-    const ngClassAttr = element.getAttribute('ng-class') || '';
-    if (classList.includes('single_selection') || ngClassAttr.includes('single_selection')) questionType = '单选题';
-    else if (classList.includes('multiple_selection') || ngClassAttr.includes('multiple_selection')) questionType = '多选题';
-    else if (classList.includes('true_or_false') || ngClassAttr.includes('true_or_false')) questionType = '判断题';
-    else if (classList.includes('fill_in_blank') || ngClassAttr.includes('fill_in_blank')) questionType = '填空题';
-    else if (classList.includes('short_answer') || ngClassAttr.includes('short_answer')) questionType = '简答题';
-    else if (classList.includes('matching') || ngClassAttr.includes('matching')) questionType = '匹配题';
+
+    // 阅读理解父题：不可填写，跳过（子题由 .reading_answer 单独检测）
+    if (questionType === '阅读理解' || questionType === '完形填空') return null;
+
+    // 阅读理解/完形填空子题 (.reading_answer)
+    const isReadingSub = classList.includes('reading_answer') || element.closest('.readComprehensionQues');
+    let passageText = '';
+    if (isReadingSub) {
+      // 从 .read_type 检测子题类型
+      const readType = element.querySelector('.read_type');
+      if (readType) {
+        const typeText = readType.textContent.trim();
+        if (typeText.includes('单选')) questionType = '单选题';
+        else if (typeText.includes('多选')) questionType = '多选题';
+        else if (typeText.includes('判断')) questionType = '判断题';
+        else if (typeText.includes('填空')) questionType = '填空题';
+        else if (typeText.includes('简答')) questionType = '简答题';
+      }
+      // 提取父题中的阅读材料
+      const parentQ = element.closest('.questionLi, .TiMu [data]');
+      if (parentQ) {
+        const markName = parentQ.querySelector('.mark_name');
+        if (markName) {
+          const clone = markName.cloneNode(true);
+          clone.querySelectorAll('.colorShallow').forEach(el => el.remove());
+          passageText = clone.textContent.trim();
+          passageText = passageText.replace(/^\d+\.\s*/, '').replace(/\([^)]*阅读理解[^)]*\)/g, '').replace(/\([^)]*完形填空[^)]*\)/g, '').replace(/\([^)]*\d+分[^)]*\)/g, '').trim();
+          passageText = passageText.replace(/[ \t]+/g, ' ').replace(/\n\s*\n/g, '\n').trim();
+        }
+      }
+    }
+
+    if (classList.includes('single_selection')) questionType = '单选题';
+    else if (classList.includes('multiple_selection')) questionType = '多选题';
+    else if (classList.includes('true_or_false')) questionType = '判断题';
+    else if (classList.includes('fill_in_blank')) questionType = '填空题';
+    else if (classList.includes('short_answer')) questionType = '简答题';
+    else if (classList.includes('matching')) questionType = '匹配题';
     else if (questionType.includes('subject.type')) {
       if (element.querySelector('input[type="radio"]') && !element.querySelector('input[type="checkbox"]')) questionType = '单选题';
       else if (element.querySelector('input[type="checkbox"]')) questionType = '多选题';
       else if (element.querySelector('input[type="text"], textarea')) questionType = '填空题';
     }
-    if (questionType === 'unknown') {
-      const innerNgIf = element.querySelector('[ng-if*="subject.type"]');
-      if (innerNgIf) { const ngIf = innerNgIf.getAttribute('ng-if') || ''; if (ngIf.includes('true_or_false')) questionType = '判断题'; else if (ngIf.includes('single_selection')) questionType = '单选题'; else if (ngIf.includes('multiple_selection')) questionType = '多选题'; else if (ngIf.includes('fill_in_blank')) questionType = '填空题'; else if (ngIf.includes('short_answer')) questionType = '简答题'; }
-    }
-    if (questionType === 'unknown' && element.querySelector('.subject-options')) { if (element.querySelector('input[type="radio"]')) questionType = '单选题'; else if (element.querySelector('input[type="checkbox"]')) questionType = '多选题'; else if (element.querySelector('input[type="text"], textarea')) questionType = '填空题'; }
     let text = '';
-    const markName = element.querySelector('.mark_name, h3.mark_name, .workTextWrap');
-    if (markName) text = markName.textContent.trim();
+    // 阅读理解子题：从 .reader_answer_tit 提取题目文本
+    if (isReadingSub) {
+      const titEl = element.querySelector('.reader_answer_tit');
+      if (titEl) {
+        const clone = titEl.cloneNode(true);
+        clone.querySelectorAll('.read_type').forEach(el => el.remove());
+        text = clone.textContent.trim();
+      }
+    }
+    if (!text) {
+      const markName = element.querySelector('.mark_name, h3.mark_name, .workTextWrap');
+      if (markName) text = markName.textContent.trim();
+    }
     if (!text) { const subjectDesc = element.querySelector('.subject-description'); if (subjectDesc) text = subjectDesc.textContent.trim(); }
     if (!text) { const summaryTitle = element.querySelector('.summary-title'); if (summaryTitle) { const clone = summaryTitle.cloneNode(true); clone.querySelectorAll('.subject-resort-index, .answer-error').forEach(el => el.remove()); text = clone.textContent.trim(); } }
     if (!text) { for (const sel of ['.question-title', '.question-content', '.problem-title', '.stem', '.question-stem', 'h3', 'h4']) { const titleEl = element.querySelector(sel); if (titleEl) { text = titleEl.textContent.trim(); if (text.length >= 5) break; } } }
-    if (!text) { const clone = element.cloneNode(true); ['.subject-options', '.subject-body', '.option', '.options', '.answer-options', '.subject-message', '.subject-score', 'button', 'input', 'textarea', '.btn', '.button', '.subject-point', '.summary-sub-title'].forEach(sel => { clone.querySelectorAll(sel).forEach(el => el.remove()); }); text = clone.textContent.trim(); }
+    if (!text) { const clone = element.cloneNode(true); ['.subject-body', '.option', '.options', '.answer-options', '.subject-message', '.subject-score', 'button', 'input', 'textarea', '.btn', '.button', '.subject-point', '.summary-sub-title'].forEach(sel => { clone.querySelectorAll(sel).forEach(el => el.remove()); }); text = clone.textContent.trim(); }
     text = cleanQuestionText(text);
-    if (text.length < 5 || text.length > 2000) return null;
+
+    // 阅读理解子题：将阅读材料附在题目前面
+    if (isReadingSub && passageText && text) {
+      text = `【阅读材料】\n${passageText}\n\n【题目】\n${text}`;
+    }
+
+    if (text.length < 5 || text.length > 4000) return null;
     const options = extractOptions(element);
     const inputs = extractInputs(element);
     const typeLC = questionType.toLowerCase();
@@ -280,8 +345,9 @@
     const answerBgs = element.querySelectorAll('.answerBg');
     answerBgs.forEach(bg => { const optionSpan = bg.querySelector('.num_option, span[data]'); const value = (optionSpan?.getAttribute('data') || optionSpan?.textContent || '').trim().toUpperCase(); const answerP = bg.querySelector('.answer_p'); const text = (answerP?.textContent || bg.textContent || '').trim(); if (value && !seen.has(value)) { seen.add(value); options.push({ value, text, element: bg }); } });
     if (options.length > 0) return options;
-    const ouchnOptions = element.querySelectorAll('.subject-options .option, .subject-options li.option');
-    ouchnOptions.forEach((opt, index) => { let value = ''; const optionIndex = opt.querySelector('.option-index, span.option-index'); if (optionIndex) value = optionIndex.textContent.trim().toUpperCase(); if (!value) { const labelEl = opt.querySelector('.option-label, label'); if (labelEl) { const match = labelEl.textContent.trim().match(/^([A-Z])/i); if (match) value = match[1].toUpperCase(); } } if (!value) value = String.fromCharCode(65 + index); const contentEl = opt.querySelector('.option-content'); const text = contentEl ? contentEl.textContent.trim() : opt.textContent.trim(); if (value && !seen.has(value)) { seen.add(value); options.push({ value, text, element: opt }); } });
+    // 阅读理解子题选项 (.stem_answer > .hoverDiv)
+    const hoverDivs = element.querySelectorAll('.stem_answer .hoverDiv, .stem_answer .clearfix');
+    hoverDivs.forEach(div => { const optionSpan = div.querySelector('.num_option, span[data]'); const value = (optionSpan?.getAttribute('data') || optionSpan?.textContent || '').trim().toUpperCase(); const answerP = div.querySelector('.answer_p'); const text = (answerP?.textContent || div.textContent || '').trim(); if (value && !seen.has(value)) { seen.add(value); options.push({ value, text, element: div }); } });
     if (options.length > 0) return options;
     const inputs = element.querySelectorAll('input[type="radio"], input[type="checkbox"]');
     inputs.forEach((input, index) => { const value = input.value || String.fromCharCode(65 + index); const label = input.closest('label') || input.parentElement; const text = label ? label.textContent.trim() : value; if (value && !seen.has(value)) { seen.add(value); options.push({ value, text, element: input }); } });
@@ -290,7 +356,7 @@
 
   function extractInputs(element) {
     const inputs = [];
-    element.querySelectorAll('input[type="text"], textarea, .blankInpDiv input, .answerBg input, .subject-answers input[type="text"], .subject-answers textarea, .cloze-sub-subjects input[type="text"], .cloze-sub-subjects textarea, .answer-content textarea, .short-answer-view ~ textarea').forEach(input => { inputs.push({ element: input, type: input.tagName.toLowerCase(), value: input.value || '' }); });
+    element.querySelectorAll('input[type="text"], textarea, .blankInpDiv input, .answerBg input, .answer-content textarea, .short-answer-view ~ textarea').forEach(input => { inputs.push({ element: input, type: input.tagName.toLowerCase(), value: input.value || '' }); });
     return inputs;
   }
 
@@ -304,18 +370,19 @@
   function detectQuestionType(element) {
     let type = element.getAttribute('typename') || ''; if (type) return type.toLowerCase();
     type = element.getAttribute('data-type') || ''; if (type) return type.toLowerCase();
-    const className = element.className || ''; const ngClass = element.getAttribute('ng-class') || '';
-    if (className.includes('single_selection') || className.includes('single-selection') || ngClass.includes('single_selection')) return '单选题';
-    if (className.includes('multiple_selection') || className.includes('multiple-selection') || ngClass.includes('multiple_selection')) return '多选题';
-    if (className.includes('true_or_false') || className.includes('true-or-false') || ngClass.includes('true_or_false')) return '判断题';
-    if (className.includes('fill_in_blank') || className.includes('fill-in-blank') || ngClass.includes('fill_in_blank')) return '填空题';
-    if (className.includes('short_answer') || className.includes('short-answer') || ngClass.includes('short_answer')) return '简答题';
-    if (className.includes('matching') || ngClass.includes('matching')) return '匹配题';
-    const innerNgIf = element.querySelector('[ng-if*="subject.type"]');
-    if (innerNgIf) { const ngIf = innerNgIf.getAttribute('ng-if') || ''; if (ngIf.includes('true_or_false')) return '判断题'; if (ngIf.includes('single_selection')) return '单选题'; if (ngIf.includes('multiple_selection')) return '多选题'; if (ngIf.includes('fill_in_blank')) return '填空题'; if (ngIf.includes('short_answer')) return '简答题'; }
+    // 阅读理解子题：从 .read_type 检测
+    const readType = element.querySelector('.read_type');
+    if (readType) { const t = readType.textContent.trim(); if (t.includes('单选')) return '单选题'; if (t.includes('多选')) return '多选题'; if (t.includes('判断')) return '判断题'; if (t.includes('填空')) return '填空题'; if (t.includes('简答')) return '简答题'; }
+    const className = element.className || '';
+    if (className.includes('single_selection') || className.includes('single-selection')) return '单选题';
+    if (className.includes('multiple_selection') || className.includes('multiple-selection')) return '多选题';
+    if (className.includes('true_or_false') || className.includes('true-or-false')) return '判断题';
+    if (className.includes('fill_in_blank') || className.includes('fill-in-blank')) return '填空题';
+    if (className.includes('short_answer') || className.includes('short-answer')) return '简答题';
+    if (className.includes('matching')) return '匹配题';
     if (element.querySelectorAll('input[type="radio"]').length > 0) return '单选题';
     if (element.querySelectorAll('input[type="checkbox"]').length > 0) return '多选题';
-    if (element.querySelectorAll('.option, .answerBg, .subject-options .option').length > 0) return '单选题';
+    if (element.querySelectorAll('.option, .answerBg, .stem_answer .hoverDiv').length > 0) return '单选题';
     if (element.querySelectorAll('input[type="text"], textarea').length > 0) return '填空题';
     if (element.querySelector('.edui-editor, textarea[id^="answerEditor"]')) return '填空题';
     return 'unknown';
@@ -333,7 +400,7 @@
   function fillBlankAnswer(element, answer, questionType = '') {
     const isShortAnswer = questionType.includes('简答') || questionType.includes('问答') || questionType.includes('short');
     if (fillUEditor(element, answer)) { highlightElement(element, 'success'); return true; }
-    const allInputs = Array.from(element.querySelectorAll('input[type="text"]:not([readonly]), textarea:not([style*="display: none"]), .blankInpDiv input, .answerBg input, .subject-answers input[type="text"], .subject-answers textarea, .cloze-sub-subjects input[type="text"], .cloze-sub-subjects textarea'));
+    const allInputs = Array.from(element.querySelectorAll('input[type="text"]:not([readonly]), textarea:not([style*="display: none"]), .blankInpDiv input, .answerBg input'));
     const uniqueInputs = [...new Set(allInputs)];
     if (uniqueInputs.length > 0) { const answers = (!isShortAnswer && uniqueInputs.length > 1) ? splitBlankAnswers(answer, uniqueInputs.length) : [answer]; let filledAny = false; for (let i = 0; i < uniqueInputs.length; i++) { if (setInputValue(uniqueInputs[i], i < answers.length ? answers[i] : (answers[answers.length - 1] || ''))) filledAny = true; } if (filledAny) { highlightElement(element, 'success'); return true; } }
     const editables = element.querySelectorAll('[contenteditable="true"]');
@@ -358,16 +425,16 @@
     let filled = false;
     // 1. 超星
     const answerBgs = element.querySelectorAll('.answerBg');
-    if (answerBgs.length > 0) { for (const bg of answerBgs) { const optionSpan = bg.querySelector('.num_option, span[data]'); const optionLetter = (optionSpan?.getAttribute('data') || optionSpan?.textContent || '').trim().toUpperCase(); if (answerLetters.includes(optionLetter)) { bg.click(); filled = true; highlightElement(bg, 'choice'); if (!isMultiple) break; } } if (filled) { highlightElement(element, 'success'); return true; } }
-    // 2. 广州开放大学
-    const ouchnOptions = element.querySelectorAll('.subject-options .option, .subject-options li.option, .option-item');
-    if (ouchnOptions.length > 0) { for (let i = 0; i < ouchnOptions.length; i++) { const opt = ouchnOptions[i]; let optionLetter = ''; const optionIndex = opt.querySelector('.option-index, span.option-index'); if (optionIndex) optionLetter = optionIndex.textContent.trim().toUpperCase(); if (!optionLetter) { const leftSpan = opt.querySelector('.left, span.left'); if (leftSpan) { const match = leftSpan.textContent.trim().match(/^([A-Z])/i); if (match) optionLetter = match[1].toUpperCase(); } } if (!optionLetter) { const labelEl = opt.querySelector('.option-label, label, .option-key'); if (labelEl) { const match = labelEl.textContent.trim().match(/^([A-Z])/i); if (match) optionLetter = match[1].toUpperCase(); } } if (!optionLetter) optionLetter = String.fromCharCode(65 + i); if (answerLetters.includes(optionLetter)) { let optionFilled = false; const input = opt.querySelector('input[type="radio"], input[type="checkbox"]'); const label = opt.querySelector('label'); if (input) { if (isMultiple && input.type === 'checkbox') optionFilled = !input.checked ? clickAngularCheckbox(input, label, opt) : true; else optionFilled = clickAngularCheckbox(input, label, opt); } else if (label) { label.click(); optionFilled = true; } else { opt.click(); optionFilled = true; } opt.click(); if (optionFilled) { filled = true; highlightElement(opt, 'choice'); } if (!isMultiple) break; } } if (filled) { highlightElement(element, 'success'); return true; } }
+    if (answerBgs.length > 0) { for (const bg of answerBgs) { const optionSpan = bg.querySelector('.num_option, span[data]'); const optionLetter = (optionSpan?.getAttribute('data') || optionSpan?.textContent || '').trim().toUpperCase(); if (answerLetters.includes(optionLetter)) { invokePageFunction('addChoice', bg); filled = true; highlightElement(bg, 'choice'); if (!isMultiple) break; } } if (filled) { highlightElement(element, 'success'); return true; } }
+    // 2. 阅读理解子题 (.stem_answer > .hoverDiv)
+    const hoverDivs = element.querySelectorAll('.stem_answer .hoverDiv, .stem_answer .clearfix');
+    if (hoverDivs.length > 0) { for (const div of hoverDivs) { const optionSpan = div.querySelector('.num_option, span[data]'); const optionLetter = (optionSpan?.getAttribute('data') || optionSpan?.textContent || '').trim().toUpperCase(); if (answerLetters.includes(optionLetter)) { invokePageFunction('addChoice', div); filled = true; highlightElement(div, 'choice'); if (!isMultiple) break; } } if (filled) { highlightElement(element, 'success'); return true; } }
     // 3. 单选框
     const radios = element.querySelectorAll('input[type="radio"]');
-    if (radios.length > 0) { for (let i = 0; i < radios.length; i++) { const radio = radios[i]; const radioValue = (radio.value || '').toUpperCase(); const label = radio.closest('label') || radio.parentElement; const labelText = (label?.textContent || '').trim().toUpperCase(); const firstLetter = labelText.charAt(0); const indexLetter = String.fromCharCode(65 + i); let optIdxLetter = ''; const optIdx = radio.closest('.option, li')?.querySelector('.option-index'); if (optIdx) optIdxLetter = optIdx.textContent.trim().toUpperCase(); if (answerLetters.includes(radioValue) || answerLetters.includes(firstLetter) || answerLetters.includes(indexLetter) || answerLetters.includes(optIdxLetter)) { clickAngularCheckbox(radio, label, radio.closest('.option, li')); highlightElement(element, 'success'); return true; } } }
+    if (radios.length > 0) { for (let i = 0; i < radios.length; i++) { const radio = radios[i]; const radioValue = (radio.value || '').toUpperCase(); const label = radio.closest('label') || radio.parentElement; const labelText = (label?.textContent || '').trim().toUpperCase(); const firstLetter = labelText.charAt(0); const indexLetter = String.fromCharCode(65 + i); if (answerLetters.includes(radioValue) || answerLetters.includes(firstLetter) || answerLetters.includes(indexLetter)) { radio.click(); radio.checked = true; triggerAllEvents(radio); highlightElement(element, 'success'); return true; } } }
     // 4. 复选框
     const checkboxes = element.querySelectorAll('input[type="checkbox"]');
-    if (checkboxes.length > 0) { for (let i = 0; i < checkboxes.length; i++) { const cb = checkboxes[i]; const cbValue = (cb.value || '').toUpperCase(); const label = cb.closest('label') || cb.parentElement; const labelText = (label?.textContent || '').trim().toUpperCase(); const firstLetter = labelText.charAt(0); const indexLetter = String.fromCharCode(65 + i); let optIdxLetter = ''; const optIdx = cb.closest('.option, li')?.querySelector('.option-index'); if (optIdx) optIdxLetter = optIdx.textContent.trim().toUpperCase(); if (answerLetters.includes(cbValue) || answerLetters.includes(firstLetter) || answerLetters.includes(indexLetter) || answerLetters.includes(optIdxLetter)) { if (!cb.checked) { clickAngularCheckbox(cb, label, cb.closest('.option, li')); filled = true; } else filled = true; } } if (filled) { highlightElement(element, 'success'); return true; } }
+    if (checkboxes.length > 0) { for (let i = 0; i < checkboxes.length; i++) { const cb = checkboxes[i]; const cbValue = (cb.value || '').toUpperCase(); const label = cb.closest('label') || cb.parentElement; const labelText = (label?.textContent || '').trim().toUpperCase(); const firstLetter = labelText.charAt(0); const indexLetter = String.fromCharCode(65 + i); if (answerLetters.includes(cbValue) || answerLetters.includes(firstLetter) || answerLetters.includes(indexLetter)) { if (!cb.checked) { cb.click(); cb.checked = true; triggerAllEvents(cb); filled = true; } else filled = true; } } if (filled) { highlightElement(element, 'success'); return true; } }
     // 5. 通用
     const clickableOptions = element.querySelectorAll('[class*="option"], [class*="choice"], [class*="answer"]');
     if (clickableOptions.length > 0) { for (let i = 0; i < clickableOptions.length; i++) { const opt = clickableOptions[i]; const optText = opt.textContent.trim().toUpperCase(); const indexLetter = String.fromCharCode(65 + i); for (const letter of answerLetters) { if (optText.startsWith(letter) || optText.startsWith(letter + '.') || optText.startsWith(letter + '、')) { opt.click(); const input = opt.querySelector('input'); if (input) { input.click(); input.checked = true; triggerAllEvents(input); } filled = true; highlightElement(opt, 'choice'); if (!isMultiple) break; } } if (filled && !isMultiple) break; } if (filled) { highlightElement(element, 'success'); return true; } }
@@ -378,20 +445,21 @@
     try { const descriptor = Object.getOwnPropertyDescriptor(input.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype, 'value'); if (descriptor && descriptor.set) descriptor.set.call(input, value); else input.value = value; input.focus(); triggerAllEvents(input); input.blur(); input.style.backgroundColor = '#e8f5e9'; setTimeout(() => { input.style.backgroundColor = ''; }, 2000); return true; } catch (e) { return false; }
   }
 
-  function clickAngularCheckbox(input, label, optionElement) {
-    try { const md = new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }); const mu = new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }); const cl = new MouseEvent('click', { bubbles: true, cancelable: true, view: window }); if (label) { label.dispatchEvent(md); label.dispatchEvent(mu); label.dispatchEvent(cl); if (input && !input.checked) { input.dispatchEvent(md); input.dispatchEvent(mu); input.dispatchEvent(cl); } } else { input.dispatchEvent(md); input.dispatchEvent(mu); input.dispatchEvent(cl); if (!input.checked) input.checked = true; } input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true })); injectAngularTrigger(input); return true; } catch (e) { return false; }
-  }
-
-  function injectAngularTrigger(element) {
-    try { const tempId = 'aa-temp-' + Date.now(); element.setAttribute('data-aa-id', tempId); const script = document.createElement('script'); script.textContent = `(function(){try{var el=document.querySelector('[data-aa-id="${tempId}"]');if(el&&typeof angular!=='undefined'){var s=angular.element(el).scope();if(s){if(s.option)s.option.checked=true;if(s.$apply)s.$apply();else if(s.$digest)s.$digest();if(s.onChangeSubmission&&s.subject)s.onChangeSubmission(s.subject);}}if(el)el.removeAttribute('data-aa-id');}catch(e){}})();`; document.head.appendChild(script); script.remove(); } catch (e) { /* ignore */ }
-  }
-
   function triggerAllEvents(element) {
     ['input', 'change', 'blur', 'keyup', 'keydown', 'keypress', 'click'].forEach(t => element.dispatchEvent(new Event(t, { bubbles: true, cancelable: true })));
     try { element.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: element.value })); } catch (e) { /* ignore */ }
     try { const ne = new Event('input', { bubbles: true }); Object.defineProperty(ne, 'target', { value: element }); element.dispatchEvent(ne); } catch (e) { /* ignore */ }
-    try { if (typeof angular !== 'undefined') { const scope = angular.element(element).scope(); if (scope && scope.$apply) scope.$apply(); } } catch (e) { /* ignore */ }
     try { element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })); } catch (e) { /* ignore */ }
+  }
+
+  function invokePageFunction(fnName, element) {
+    const tempId = 'aa-invoke-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
+    element.setAttribute('data-aa-invoke', tempId);
+    const script = document.createElement('script');
+    script.textContent = `(function(){try{var el=document.querySelector('[data-aa-invoke="${tempId}"]');if(el){if(typeof ${fnName}==='function'){${fnName}(el);}else{el.click();}el.removeAttribute('data-aa-invoke');}}catch(e){}})();`;
+    document.documentElement.appendChild(script);
+    script.remove();
+    element.removeAttribute('data-aa-invoke');
   }
 
   function splitBlankAnswers(answer, count) { const parts = answer.split(/[，,、\n]/).map(i => i.trim()).filter(Boolean); if (parts.length >= count && count > 1) return parts.slice(0, count); return new Array(count).fill(answer.trim()); }
@@ -504,7 +572,7 @@
             try {
               const ctx = buildQuestionContext(questions, index, this.settings);
               const res = await callAPI({ text: question.text, context: ctx }, this.settings);
-              if (res && res.success && res.answer) { answer = res.answer; const filled = tryFillAnswer(question.element, res.answer); if (filled !== false) { this.answeredCount++; success = true; } else { this.failedCount++; errorMsg = '填写失败'; } break; }
+              if (res && res.success && res.answer) { answer = res.answer; const filled = tryFillAnswer(question.element, res.answer); if (filled !== false) { this.answeredCount++; success = true; } else { errorMsg = '填写失败'; } break; }
               else errorMsg = res?.error || '未知错误';
             } catch (e) { errorMsg = e.message; }
             retries--; if (retries >= 0 && this.isRunning) await new Promise(r => setTimeout(r, 1000));
@@ -661,12 +729,9 @@
             <div class="aa-section">
               <div class="aa-label">API提供商预设</div>
               <select class="aa-input" id="aa-api-provider">
-                <option value="openai">OpenAI (api.openai.com)</option>
-                <option value="openai-o1">OpenAI o1 推理模型</option>
-                <option value="deepseek">DeepSeek (api.deepseek.com)</option>
-                <option value="deepseek-reasoner">DeepSeek R1 推理模型</option>
+                <option value="openai">OpenAI</option>
+                <option value="deepseek">DeepSeek</option>
                 <option value="custom">自定义</option>
-                <option value="custom-reasoning">自定义 (推理模型)</option>
               </select>
             </div>
             <div class="aa-section">
@@ -684,7 +749,23 @@
             </div>
             <div class="aa-section">
               <div class="aa-label">模型</div>
-              <input type="text" class="aa-input" id="aa-model" placeholder="gpt-4o-mini">
+              <div class="aa-input-row">
+                <input type="text" class="aa-input" id="aa-model" placeholder="gpt-4o-mini">
+                <button class="aa-btn aa-btn-sm aa-btn-s" id="aa-fetch-models">📋</button>
+              </div>
+              <select class="aa-input" id="aa-model-list" style="display:none;margin-top:6px;"></select>
+            </div>
+            <div class="aa-section">
+              <div class="aa-switch-row"><label class="aa-switch"><input type="checkbox" id="aa-is-reasoning"><span class="aa-slider"></span></label><span class="aa-switch-l">思考模式</span></div>
+              <div id="aa-reasoning-options" style="display:none;margin-top:8px;">
+                <div class="aa-label">思考强度</div>
+                <select class="aa-input" id="aa-reasoning-effort">
+                  <option value="low">低 (low)</option>
+                  <option value="medium">中 (medium)</option>
+                  <option value="high" selected>高 (high)</option>
+                  <option value="xhigh">极高 (xhigh)</option>
+                </select>
+              </div>
             </div>
             <div class="aa-section">
               <div class="aa-row-2">
@@ -857,11 +938,22 @@
       // API提供商
       $('aa-api-provider').addEventListener('change', (e) => this.onApiProviderChange(e.target.value));
 
+      // 思考模式开关
+      $('aa-is-reasoning').addEventListener('change', (e) => {
+        $('aa-reasoning-options').style.display = e.target.checked ? '' : 'none';
+      });
+
       // 保存设置
       $('aa-save-settings').addEventListener('click', () => { this.saveSettingsFromForm(); showNotification('设置已保存', 'success'); });
 
       // 测试API
       $('aa-test-api').addEventListener('click', () => this.testAPI());
+
+      // 获取模型列表
+      $('aa-fetch-models').addEventListener('click', () => this.loadModelList());
+      $('aa-model-list').addEventListener('change', (e) => {
+        if (e.target.value) $('aa-model').value = e.target.value;
+      });
 
       // 导出
       $('aa-export').addEventListener('click', () => {
@@ -888,15 +980,12 @@
 
     onApiProviderChange(provider) {
       const presets = {
-        openai: { baseUrl: 'https://api.openai.com', chatPath: '/v1/chat/completions', model: 'gpt-4o-mini', isReasoning: false },
-        'openai-o1': { baseUrl: 'https://api.openai.com', chatPath: '/v1/chat/completions', model: 'o1-mini', isReasoning: true },
-        deepseek: { baseUrl: 'https://api.deepseek.com', chatPath: '/v1/chat/completions', model: 'deepseek-chat', isReasoning: false },
-        'deepseek-reasoner': { baseUrl: 'https://api.deepseek.com', chatPath: '/v1/chat/completions', model: 'deepseek-reasoner', isReasoning: true },
-        custom: { baseUrl: this.settings.baseUrl || '', chatPath: this.settings.chatPath || '/v1/chat/completions', model: this.settings.model || '', isReasoning: false },
-        'custom-reasoning': { baseUrl: this.settings.baseUrl || '', chatPath: this.settings.chatPath || '/v1/chat/completions', model: this.settings.model || '', isReasoning: true }
+        openai: { baseUrl: 'https://api.openai.com', chatPath: '/v1/chat/completions', model: 'gpt-4o-mini' },
+        deepseek: { baseUrl: 'https://api.deepseek.com', chatPath: '/chat/completions', model: 'deepseek-chat' },
+        custom: { baseUrl: this.settings.baseUrl || '', chatPath: this.settings.chatPath || '/v1/chat/completions', model: this.settings.model || '' }
       };
       const p = presets[provider]; if (!p) return;
-      if (!provider.startsWith('custom')) {
+      if (provider !== 'custom') {
         document.getElementById('aa-base-url').value = p.baseUrl;
         document.getElementById('aa-chat-path').value = p.chatPath;
         document.getElementById('aa-model').value = p.model;
@@ -911,6 +1000,9 @@
       $('aa-base-url').value = s.baseUrl || '';
       $('aa-chat-path').value = s.chatPath || '';
       $('aa-model').value = s.model || '';
+      $('aa-is-reasoning').checked = s.isReasoning || false;
+      $('aa-reasoning-options').style.display = s.isReasoning ? '' : 'none';
+      $('aa-reasoning-effort').value = s.reasoningEffort || 'high';
       $('aa-temperature').value = s.temperature; $('aa-temp-v').textContent = s.temperature;
       $('aa-max-tokens').value = s.maxTokens;
       $('aa-top-p').value = s.topP; $('aa-topp-v').textContent = s.topP;
@@ -938,6 +1030,8 @@
       this.settings.baseUrl = $('aa-base-url').value;
       this.settings.chatPath = $('aa-chat-path').value;
       this.settings.model = $('aa-model').value;
+      this.settings.isReasoning = $('aa-is-reasoning').checked;
+      this.settings.reasoningEffort = $('aa-reasoning-effort').value;
       this.settings.temperature = parseFloat($('aa-temperature').value);
       this.settings.maxTokens = parseInt($('aa-max-tokens').value);
       this.settings.topP = parseFloat($('aa-top-p').value);
@@ -956,8 +1050,6 @@
       this.settings.retryCount = parseInt($('aa-retry-count').value);
       this.settings.contextBeforeCount = parseInt($('aa-ctx-before').value);
       this.settings.contextAfterCount = parseInt($('aa-ctx-after').value);
-      const provider = $('aa-api-provider').value;
-      this.settings.isReasoning = ['openai-o1', 'deepseek-reasoner', 'custom-reasoning'].includes(provider);
       this.saveSettings();
     }
 
@@ -970,6 +1062,23 @@
         rd.innerHTML = r.success ? `<div style="color:var(--aa-ok,#34d399);padding:6px;font-family:var(--aa-mono);">&#x2713; Connected - model: ${r.model || this.settings.model}</div>` : `<div style="color:var(--aa-err,#f87171);padding:6px;">&#x2717; ${r.error || 'Unknown error'}</div>`;
       } catch (e) { rd.innerHTML = `<div style="color:var(--aa-err,#f87171);padding:6px;">&#x2717; ${e.message}</div>`; }
       btn.disabled = false; btn.textContent = 'Test API';
+    }
+
+    async loadModelList() {
+      const btn = document.getElementById('aa-fetch-models');
+      const select = document.getElementById('aa-model-list');
+      btn.disabled = true; btn.textContent = '⏳';
+      this.saveSettingsFromForm();
+      try {
+        const models = await fetchModels(this.settings);
+        select.innerHTML = '<option value="">-- 选择模型 --</option>';
+        models.forEach(m => { const opt = document.createElement('option'); opt.value = m; opt.textContent = m; if (m === this.settings.model) opt.selected = true; select.appendChild(opt); });
+        select.style.display = '';
+        showNotification(`获取到 ${models.length} 个模型`, 'success');
+      } catch (e) {
+        showNotification(`获取模型列表失败: ${e.message}`, 'error');
+      }
+      btn.disabled = false; btn.textContent = '📋';
     }
 
     updatePanelStats() {
