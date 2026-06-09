@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         自动答题助手
 // @namespace    https://github.com/auto-answer-assistant
-// @version      1.3.0
+// @version      1.3.1
 // @description  智能识别网页题目，调用AI API自动作答，支持超星学习通平台
 // @author       Auto Answer Assistant
 // @match        *://*.chaoxing.com/*
@@ -340,14 +340,25 @@
 
   function cleanQuestionText(text) { text = text.replace(/^\d+\.\s*/, ''); text = text.replace(/\([^)]*题[^)]*分\)/g, ''); text = text.replace(/\s+/g, ' ').trim(); return text; }
 
+  function extractOptionLetter(optionSpan) {
+    if (!optionSpan) return '';
+    // 优先取 textContent（始终是可见字母 A/B/C/D），data 属性在判断题中为 "true"/"false"
+    const text = (optionSpan.textContent || '').trim().toUpperCase();
+    if (/^[A-Z]$/.test(text)) return text;
+    const data = (optionSpan.getAttribute('data') || '').trim().toUpperCase();
+    if (/^[A-Z]$/.test(data)) return data;
+    // 兜底：取文本首字母
+    return text.charAt(0) || data.charAt(0) || '';
+  }
+
   function extractOptions(element) {
     const options = []; const seen = new Set();
     const answerBgs = element.querySelectorAll('.answerBg');
-    answerBgs.forEach(bg => { const optionSpan = bg.querySelector('.num_option, span[data]'); const value = (optionSpan?.getAttribute('data') || optionSpan?.textContent || '').trim().toUpperCase(); const answerP = bg.querySelector('.answer_p'); const text = (answerP?.textContent || bg.textContent || '').trim(); if (value && !seen.has(value)) { seen.add(value); options.push({ value, text, element: bg }); } });
+    answerBgs.forEach(bg => { const optionSpan = bg.querySelector('.num_option, span[data]'); const value = extractOptionLetter(optionSpan); const answerP = bg.querySelector('.answer_p'); const text = (answerP?.textContent || bg.textContent || '').trim(); if (value && !seen.has(value)) { seen.add(value); options.push({ value, text, element: bg }); } });
     if (options.length > 0) return options;
     // 阅读理解子题选项 (.stem_answer > .hoverDiv)
     const hoverDivs = element.querySelectorAll('.stem_answer .hoverDiv, .stem_answer .clearfix');
-    hoverDivs.forEach(div => { const optionSpan = div.querySelector('.num_option, span[data]'); const value = (optionSpan?.getAttribute('data') || optionSpan?.textContent || '').trim().toUpperCase(); const answerP = div.querySelector('.answer_p'); const text = (answerP?.textContent || div.textContent || '').trim(); if (value && !seen.has(value)) { seen.add(value); options.push({ value, text, element: div }); } });
+    hoverDivs.forEach(div => { const optionSpan = div.querySelector('.num_option, span[data]'); const value = extractOptionLetter(optionSpan); const answerP = div.querySelector('.answer_p'); const text = (answerP?.textContent || div.textContent || '').trim(); if (value && !seen.has(value)) { seen.add(value); options.push({ value, text, element: div }); } });
     if (options.length > 0) return options;
     const inputs = element.querySelectorAll('input[type="radio"], input[type="checkbox"]');
     inputs.forEach((input, index) => { const value = input.value || String.fromCharCode(65 + index); const label = input.closest('label') || input.parentElement; const text = label ? label.textContent.trim() : value; if (value && !seen.has(value)) { seen.add(value); options.push({ value, text, element: input }); } });
@@ -423,21 +434,90 @@
     const answerLetters = answer.replace(/[,、\s]/g, '').split('').filter(c => /[A-Z]/.test(c));
     if (answerLetters.length === 0) { if (answer.includes('对') || answer.includes('正确') || answer.includes('TRUE') || answer.includes('YES')) answerLetters.push('A'); else if (answer.includes('错') || answer.includes('错误') || answer.includes('FALSE') || answer.includes('NO')) answerLetters.push('B'); }
     let filled = false;
-    // 1. 超星
+    // 1. 超星 .answerBg（单选/多选/判断题通用）
     const answerBgs = element.querySelectorAll('.answerBg');
-    if (answerBgs.length > 0) { for (const bg of answerBgs) { const optionSpan = bg.querySelector('.num_option, span[data]'); const optionLetter = (optionSpan?.getAttribute('data') || optionSpan?.textContent || '').trim().toUpperCase(); if (answerLetters.includes(optionLetter)) { invokePageFunction('addChoice', bg); filled = true; highlightElement(bg, 'choice'); if (!isMultiple) break; } } if (filled) { highlightElement(element, 'success'); return true; } }
+    if (answerBgs.length > 0) {
+      for (const bg of answerBgs) {
+        const optionSpan = bg.querySelector('.num_option, span[data]');
+        const optionLetter = extractOptionLetter(optionSpan);
+        if (answerLetters.includes(optionLetter)) {
+          clickInPage(bg);
+          filled = true;
+          highlightElement(bg, 'choice');
+          if (!isMultiple) break;
+        }
+      }
+      if (filled) { highlightElement(element, 'success'); return true; }
+    }
     // 2. 阅读理解子题 (.stem_answer > .hoverDiv)
     const hoverDivs = element.querySelectorAll('.stem_answer .hoverDiv, .stem_answer .clearfix');
-    if (hoverDivs.length > 0) { for (const div of hoverDivs) { const optionSpan = div.querySelector('.num_option, span[data]'); const optionLetter = (optionSpan?.getAttribute('data') || optionSpan?.textContent || '').trim().toUpperCase(); if (answerLetters.includes(optionLetter)) { invokePageFunction('addChoice', div); filled = true; highlightElement(div, 'choice'); if (!isMultiple) break; } } if (filled) { highlightElement(element, 'success'); return true; } }
-    // 3. 单选框
+    if (hoverDivs.length > 0) {
+      for (const div of hoverDivs) {
+        const optionSpan = div.querySelector('.num_option, span[data]');
+        const optionLetter = extractOptionLetter(optionSpan);
+        if (answerLetters.includes(optionLetter)) {
+          clickInPage(div);
+          filled = true;
+          highlightElement(div, 'choice');
+          if (!isMultiple) break;
+        }
+      }
+      if (filled) { highlightElement(element, 'success'); return true; }
+    }
+    // 3. 单选框 radio（在页面上下文中点击其关联 label 或自身）
     const radios = element.querySelectorAll('input[type="radio"]');
-    if (radios.length > 0) { for (let i = 0; i < radios.length; i++) { const radio = radios[i]; const radioValue = (radio.value || '').toUpperCase(); const label = radio.closest('label') || radio.parentElement; const labelText = (label?.textContent || '').trim().toUpperCase(); const firstLetter = labelText.charAt(0); const indexLetter = String.fromCharCode(65 + i); if (answerLetters.includes(radioValue) || answerLetters.includes(firstLetter) || answerLetters.includes(indexLetter)) { radio.click(); radio.checked = true; triggerAllEvents(radio); highlightElement(element, 'success'); return true; } } }
-    // 4. 复选框
+    if (radios.length > 0) {
+      for (let i = 0; i < radios.length; i++) {
+        const radio = radios[i];
+        const radioValue = (radio.value || '').toUpperCase();
+        const label = radio.closest('label') || radio.parentElement;
+        const labelText = (label?.textContent || '').trim().toUpperCase();
+        const firstLetter = labelText.charAt(0);
+        const indexLetter = String.fromCharCode(65 + i);
+        if (answerLetters.includes(radioValue) || answerLetters.includes(firstLetter) || answerLetters.includes(indexLetter)) {
+          clickInPage(label || radio);
+          filled = true;
+          highlightElement(element, 'success');
+          return true;
+        }
+      }
+    }
+    // 4. 复选框 checkbox（在页面上下文中点击其关联 label 或自身）
     const checkboxes = element.querySelectorAll('input[type="checkbox"]');
-    if (checkboxes.length > 0) { for (let i = 0; i < checkboxes.length; i++) { const cb = checkboxes[i]; const cbValue = (cb.value || '').toUpperCase(); const label = cb.closest('label') || cb.parentElement; const labelText = (label?.textContent || '').trim().toUpperCase(); const firstLetter = labelText.charAt(0); const indexLetter = String.fromCharCode(65 + i); if (answerLetters.includes(cbValue) || answerLetters.includes(firstLetter) || answerLetters.includes(indexLetter)) { if (!cb.checked) { cb.click(); cb.checked = true; triggerAllEvents(cb); filled = true; } else filled = true; } } if (filled) { highlightElement(element, 'success'); return true; } }
-    // 5. 通用
+    if (checkboxes.length > 0) {
+      for (let i = 0; i < checkboxes.length; i++) {
+        const cb = checkboxes[i];
+        const cbValue = (cb.value || '').toUpperCase();
+        const label = cb.closest('label') || cb.parentElement;
+        const labelText = (label?.textContent || '').trim().toUpperCase();
+        const firstLetter = labelText.charAt(0);
+        const indexLetter = String.fromCharCode(65 + i);
+        if (answerLetters.includes(cbValue) || answerLetters.includes(firstLetter) || answerLetters.includes(indexLetter)) {
+          clickInPage(label || cb);
+          filled = true;
+        }
+      }
+      if (filled) { highlightElement(element, 'success'); return true; }
+    }
+    // 5. 通用选择器（在页面上下文中点击）
     const clickableOptions = element.querySelectorAll('[class*="option"], [class*="choice"], [class*="answer"]');
-    if (clickableOptions.length > 0) { for (let i = 0; i < clickableOptions.length; i++) { const opt = clickableOptions[i]; const optText = opt.textContent.trim().toUpperCase(); const indexLetter = String.fromCharCode(65 + i); for (const letter of answerLetters) { if (optText.startsWith(letter) || optText.startsWith(letter + '.') || optText.startsWith(letter + '、')) { opt.click(); const input = opt.querySelector('input'); if (input) { input.click(); input.checked = true; triggerAllEvents(input); } filled = true; highlightElement(opt, 'choice'); if (!isMultiple) break; } } if (filled && !isMultiple) break; } if (filled) { highlightElement(element, 'success'); return true; } }
+    if (clickableOptions.length > 0) {
+      for (let i = 0; i < clickableOptions.length; i++) {
+        const opt = clickableOptions[i];
+        const optText = opt.textContent.trim().toUpperCase();
+        const indexLetter = String.fromCharCode(65 + i);
+        for (const letter of answerLetters) {
+          if (optText.startsWith(letter) || optText.startsWith(letter + '.') || optText.startsWith(letter + '、')) {
+            clickInPage(opt);
+            filled = true;
+            highlightElement(opt, 'choice');
+            if (!isMultiple) break;
+          }
+        }
+        if (filled && !isMultiple) break;
+      }
+      if (filled) { highlightElement(element, 'success'); return true; }
+    }
     highlightElement(element, 'error'); return false;
   }
 
@@ -452,11 +532,23 @@
     try { element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })); } catch (e) { /* ignore */ }
   }
 
+  // 在页面上下文中模拟真实点击（绕过 Tampermonkey 沙盒限制）
+  function clickInPage(element) {
+    const tempId = 'aa-click-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
+    element.setAttribute('data-aa-click', tempId);
+    const script = document.createElement('script');
+    script.textContent = `(function(){try{var el=document.querySelector('[data-aa-click="${tempId}"]');if(el){el.click();el.removeAttribute('data-aa-click');}}catch(e){console.error('[AutoAnswer] clickInPage error:',e);}})();`;
+    document.documentElement.appendChild(script);
+    script.remove();
+    element.removeAttribute('data-aa-click');
+  }
+
+  // 在页面上下文中直接调用指定函数（备用方案，当 click() 无效时使用）
   function invokePageFunction(fnName, element) {
     const tempId = 'aa-invoke-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
     element.setAttribute('data-aa-invoke', tempId);
     const script = document.createElement('script');
-    script.textContent = `(function(){try{var el=document.querySelector('[data-aa-invoke="${tempId}"]');if(el){if(typeof ${fnName}==='function'){${fnName}(el);}else{el.click();}el.removeAttribute('data-aa-invoke');}}catch(e){}})();`;
+    script.textContent = `(function(){try{var el=document.querySelector('[data-aa-invoke="${tempId}"]');if(el){if(typeof ${fnName}==='function'){${fnName}.call(el);}else{el.click();}el.removeAttribute('data-aa-invoke');}}catch(e){console.error('[AutoAnswer] invokePageFunction error:',e);}})();`;
     document.documentElement.appendChild(script);
     script.remove();
     element.removeAttribute('data-aa-invoke');
